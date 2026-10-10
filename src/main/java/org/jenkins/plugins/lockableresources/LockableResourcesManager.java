@@ -45,6 +45,7 @@ import jenkins.model.Jenkins;
 import jenkins.util.SystemProperties;
 import net.sf.json.JSONObject;
 import org.jenkins.plugins.lockableresources.actions.LockedResourcesBuildAction;
+import org.jenkins.plugins.lockableresources.cluster.ClusterLocks;
 import org.jenkins.plugins.lockableresources.queue.LockableResourcesStruct;
 import org.jenkins.plugins.lockableresources.queue.QueuedContextStruct;
 import org.jenkins.plugins.lockableresources.remote.RemoteCatalogCache;
@@ -956,6 +957,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
             return false; // not locked
         }
 
+        if (!ClusterLocks.acquire(resourcesToLock, build)) {
+            LOGGER.fine("lock() for build " + build + ": some resource is locked on another controller");
+            return false; // not locked; it stays queued and is retried when released there
+        }
+
         for (LockableResource r : resourcesToLock) {
             r.unqueue();
             r.setBuild(build);
@@ -993,6 +999,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
             resource.unqueue();
             resource.setBuild(null);
             resource.setLockReason(null);
+            ClusterLocks.release(resource, build);
             audit("LOCAL", "RELEASED", resource.getName(), build.getExternalizableId());
             uncacheIfFreeing(resource, true, false);
 

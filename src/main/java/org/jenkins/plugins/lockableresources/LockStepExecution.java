@@ -103,10 +103,10 @@ public class LockStepExecution extends AbstractStepExecutionImpl implements Remo
                 }
 
                 if (!lrm.lock(available, run, step.reason)) {
-                    // this here is very defensive code, and you will probably never hit it. (hopefully)
-                    LOGGER.warning("Internal program error: Can not lock resources: " + available);
+                    // e.g. taken on another controller meanwhile (ClusterLocks): wait in the queue like any other
+                    LOGGER.fine("Can not lock resources now: " + available);
                     onLockFailed(logger, resourceHolderList);
-                    return true;
+                    return false;
                 }
 
                 // since LockableResource contains transient variables, they cannot be correctly serialized
