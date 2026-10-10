@@ -56,7 +56,9 @@
     <changelist>999999-SNAPSHOT</changelist>
     <!-- https://www.jenkins.io/doc/developer/plugin-development/choosing-jenkins-baseline/ -->
     <jenkins.baseline>2.541</jenkins.baseline>
-    <jenkins.version>${jenkins.baseline}.3</jenkins.version>
+    <!-- cnj Target 5: built against the locally installed core with the jenkins.persistence SPI. Revert before upstreaming. -->
+    <jenkins.version>2.586-SNAPSHOT</jenkins.version>
+    <useBeta>true</useBeta>
     <gitHubRepo>jenkinsci/${project.artifactId}-plugin</gitHubRepo>
     <spotbugs.effort>Max</spotbugs.effort>
     <spotbugs.threshold>Low</spotbugs.threshold>
