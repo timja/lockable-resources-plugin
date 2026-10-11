@@ -32,6 +32,7 @@ import org.jenkins.plugins.lockableresources.FreeDeadJobs;
 import org.jenkins.plugins.lockableresources.LockableResource;
 import org.jenkins.plugins.lockableresources.LockableResourceProperty;
 import org.jenkins.plugins.lockableresources.LockableResourcesManager;
+import org.jenkins.plugins.lockableresources.cluster.ClusterLocks;
 import org.jenkins.plugins.lockableresources.Messages;
 import org.jenkins.plugins.lockableresources.RemoteConnection;
 import org.jenkins.plugins.lockableresources.queue.LockableResourcesStruct;
@@ -1157,6 +1158,7 @@ public class LockableResourcesRootAction implements RootAction {
             }
             resource.setNote(resourceNote);
             LockableResourcesManager.get().save();
+            ClusterLocks.publishDefinition(resource);
 
             rsp.forwardToPreviousPage(req);
         }
@@ -1513,6 +1515,7 @@ public class LockableResourcesRootAction implements RootAction {
             rsp.sendError(409, Messages.error_resourceAlreadyExists(name));
             return;
         }
+        ClusterLocks.publishDefinition(resource);
 
         rsp.forwardToPreviousPage(req);
     }
@@ -1553,6 +1556,7 @@ public class LockableResourcesRootAction implements RootAction {
             resource.setProperties(parsePropertiesFromJson(json));
 
             manager.save();
+            ClusterLocks.publishDefinition(resource);
         }
         rsp.forwardToPreviousPage(req);
     }
@@ -1584,6 +1588,7 @@ public class LockableResourcesRootAction implements RootAction {
             toRemove.add(resource);
             manager.removeResources(toRemove);
             manager.save();
+            ClusterLocks.deleteDefinition(name);
         }
         rsp.forwardToPreviousPage(req);
     }

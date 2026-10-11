@@ -1053,6 +1053,15 @@ public class LockableResourcesManager extends GlobalConfiguration {
             return;
         }
         synchronized (syncResources) {
+            if (build == null) {
+                // unlocked from the resources page: a resource held on another controller is freed there
+                for (LockableResource r : resourcesToUnLock) {
+                    if (ClusterLocks.isHeldElsewhere(r)) {
+                        ClusterLocks.free(r);
+                        r.setRemoteLockedBy(null);
+                    }
+                }
+            }
             this.freeResources(resourcesToUnLock, build);
 
             while (proceedNextContext()) {
@@ -1426,6 +1435,10 @@ public class LockableResourcesManager extends GlobalConfiguration {
                     return false;
                 }
             }
+            if (!ClusterLocks.reserve(resources, userName, reason)) {
+                LOGGER.fine("reserve() failed because a resource is held on another controller");
+                return false;
+            }
             for (LockableResource r : resources) {
                 r.reserve(userName, reason);
             }
@@ -1459,6 +1472,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
     public boolean steal(List<LockableResource> resources, String userName, String reason) {
         synchronized (syncResources) {
             for (LockableResource r : resources) {
+                ClusterLocks.reserveForcibly(r, userName, reason, true); // before freeing: its build's release keeps it
                 r.setReservedBy(userName);
                 r.setStolen();
             }
@@ -1483,6 +1497,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
         synchronized (syncResources) {
             Date date = new Date();
             for (LockableResource r : resources) {
+                ClusterLocks.reserveForcibly(r, userName, null, false);
                 if (!r.isFree()) {
                     r.unReserve();
                 }
@@ -1496,6 +1511,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
     // ---------------------------------------------------------------------------
     private void unreserveResources(@NonNull List<LockableResource> resources) {
         for (LockableResource l : resources) {
+            ClusterLocks.unreserve(l);
             uncacheIfFreeing(l, false, true);
             l.unReserve();
         }
@@ -1531,6 +1547,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
     public void reset(List<LockableResource> resources) {
         synchronized (syncResources) {
             for (LockableResource r : resources) {
+                ClusterLocks.free(r);
                 uncacheIfFreeing(r, true, true);
                 r.reset();
             }
