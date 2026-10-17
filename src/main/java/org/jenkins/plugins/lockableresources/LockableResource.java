@@ -95,6 +95,9 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
      */
     private transient volatile String remoteLockedBy;
 
+    /** Who holds this resource on another controller, as told by the {@link LockCoordinator}; null if nobody. */
+    private transient volatile String heldElsewhereBy;
+
     /**
      * We can use arbitrary identifier in a temporary lock (e.g. a commit hash of built/tested
      * sources), and not overwhelm Jenkins with lots of "garbage" locks. Such locks will be
@@ -605,7 +608,22 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
 
     @Exported
     public boolean isLocked() {
-        return getBuild() != null || remoteLockedBy != null;
+        return getBuild() != null || remoteLockedBy != null || heldElsewhereBy != null;
+    }
+
+    /**
+     * Who holds this resource on another controller sharing it (see {@link LockCoordinator}), for display.
+     *
+     * @return such as {@code folder/job#7 on controller-2}, or null if it is not held elsewhere
+     */
+    @CheckForNull
+    public String getHeldElsewhereBy() {
+        return heldElsewhereBy;
+    }
+
+    /** Set by the {@link LockCoordinator}: the resource counts as locked while held elsewhere. */
+    public void setHeldElsewhereBy(@CheckForNull String holder) {
+        this.heldElsewhereBy = holder;
     }
 
     public String getRemoteLockedBy() {
@@ -659,6 +677,9 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
             RemoteLockRecord record = getRemoteLockRecord();
             return String.format("[%s] is locked by %s at %s", name, remoteHolder(record), remoteSince(record, format));
         }
+        if (buildExternalizableId == null && heldElsewhereBy != null) {
+            return String.format("[%s] is locked by %s", name, heldElsewhereBy);
+        }
         if (isLocked()) {
             return String.format("[%s] is locked by %s at %s", name, buildExternalizableId, timestamp);
         }
@@ -711,6 +732,9 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
                 return String.format(
                         "The resource [%s] is locked by %s (lockId %s) since %s.",
                         name, remoteHolder(record), remoteLockedBy, remoteSince(record, format));
+            }
+            if (heldElsewhereBy != null) {
+                return String.format("The resource [%s] is locked by %s.", name, heldElsewhereBy);
             }
         }
         return null;
