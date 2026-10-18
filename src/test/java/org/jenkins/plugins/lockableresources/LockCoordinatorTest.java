@@ -17,11 +17,16 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.util.NameValuePair;
+import org.jenkins.plugins.lockableresources.remote.RemoteLockManager;
+import org.jenkins.plugins.lockableresources.remote.RemoteLockRecord;
+import org.jenkins.plugins.lockableresources.remote.RemoteLockRequest;
+import org.jenkins.plugins.lockableresources.remote.RemoteLockState;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
@@ -155,6 +160,55 @@ class LockCoordinatorTest {
         assertThat(fake.calls, contains("definitionChanged made", "definitionChanged made", "definitionDeleted made"));
     }
 
+    private static RemoteLockRequest remoteRequest(String resource, boolean skipIfLocked) {
+        return new RemoteLockRequest(
+                resource, null, 0, null, false, "SEQUENTIAL", skipIfLocked, null, 0, 0, "MINUTES", null);
+    }
+
+    private void exposeRes() {
+        lrm.setRemoteApiEnabled(true);
+        lrm.setExposeLabel("remote-ok");
+        lrm.fromName("res").setLabelsFromString("remote-ok");
+    }
+
+    @Test
+    void remoteLockHeldElsewhereWaitsUntilReleasedThere() {
+        exposeRes();
+        fake.elsewhere.add("res"); // taken elsewhere, not known here yet: it looks free
+        RemoteLockRecord record = RemoteLockManager.get().enqueue(remoteRequest("res", false), "client-1");
+        assertEquals(RemoteLockState.QUEUED, record.getState());
+        assertTrue(record.getLockId().startsWith("fake-"), "the coordinator's id");
+        assertNull(lrm.fromName("res").getRemoteLockedBy());
+        assertThat(fake.calls, hasItem("tryLockForRemote [res] " + record.getLockId()));
+        assertEquals(
+                RemoteLockState.SKIPPED,
+                RemoteLockManager.get()
+                        .enqueue(remoteRequest("res", true), "client-2")
+                        .getState());
+
+        fake.elsewhere.remove("res");
+        lrm.refreshQueue();
+        assertEquals(RemoteLockState.ACQUIRED, record.getState());
+        assertEquals(record.getLockId(), lrm.fromName("res").getRemoteLockedBy());
+
+        RemoteLockManager.get().release(record.getLockId());
+        assertNull(lrm.fromName("res").getRemoteLockedBy());
+        assertThat(fake.calls, hasItem("releasedForRemote res " + record.getLockId()));
+    }
+
+    @Test
+    void remoteLockEndedByTheCoordinator() {
+        exposeRes();
+        RemoteLockRecord record = RemoteLockManager.get().enqueue(remoteRequest("res", false), "client-1");
+        assertEquals(RemoteLockState.ACQUIRED, record.getState());
+        // freed or taken on another controller meanwhile
+        lrm.releaseRemoteLock(record.getLockId());
+        assertNull(lrm.fromName("res").getRemoteLockedBy());
+        assertEquals(RemoteLockState.FAILED, record.getState());
+        lrm.releaseRemoteLock(record.getLockId()); // again: nothing
+        lrm.releaseRemoteLock("unknown");
+    }
+
     private void post(JenkinsRule.WebClient wc, String action, String... params) throws Exception {
         WebRequest req = new WebRequest(new URL(j.getURL(), "lockable-resources/" + action), HttpMethod.POST);
         List<NameValuePair> pairs = new ArrayList<>();
@@ -184,6 +238,23 @@ class LockCoordinatorTest {
                 return false;
             }
             return resources.stream().noneMatch(r -> elsewhere.contains(r.getName()));
+        }
+
+        @Override
+        public boolean tryLockForRemote(@NonNull List<LockableResource> resources, @NonNull String lockId) {
+            calls.add("tryLockForRemote " + names(resources) + " " + lockId);
+            return resources.stream().noneMatch(r -> elsewhere.contains(r.getName()));
+        }
+
+        @Override
+        public void releasedForRemote(@NonNull LockableResource resource, @NonNull String lockId) {
+            calls.add("releasedForRemote " + resource.getName() + " " + lockId);
+        }
+
+        @NonNull
+        @Override
+        public String newRemoteLockId() {
+            return "fake-" + UUID.randomUUID();
         }
 
         @Override
