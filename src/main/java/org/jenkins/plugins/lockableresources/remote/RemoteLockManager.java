@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import org.jenkins.plugins.lockableresources.LockCoordinator;
 import org.jenkins.plugins.lockableresources.LockableResource;
 import org.jenkins.plugins.lockableresources.LockableResourcesManager;
 import org.jenkins.plugins.lockableresources.queue.LockableResourcesStruct;
@@ -85,7 +86,8 @@ public class RemoteLockManager extends PeriodicWork {
      * queue so it participates in unified priority dispatch with local pipeline lock() steps.
      */
     public RemoteLockRecord enqueue(@NonNull RemoteLockRequest lockRequest, @CheckForNull String clientId) {
-        String lockId = UUID.randomUUID().toString();
+        LockCoordinator coordinator = LockCoordinator.get();
+        String lockId = coordinator == null ? UUID.randomUUID().toString() : coordinator.newRemoteLockId();
         RemoteLockRecord record = new RemoteLockRecord(lockId, lockRequest, clientId);
 
         LockableResourcesManager lrm = LockableResourcesManager.get();
@@ -126,8 +128,8 @@ public class RemoteLockManager extends PeriodicWork {
                 }
             } else {
                 List<LockableResource> available = resolver.availableForRemote(structs, lockRequest);
-                if (available != null && !available.isEmpty()) {
-                    lrm.lockForRemote(available, lockId);
+                // with a LockCoordinator, resources free here may be held elsewhere: then busy, as below
+                if (available != null && !available.isEmpty() && lrm.lockForRemote(available, lockId)) {
                     record.markAcquired(
                             LockableResourcesManager.getResourcesNames(available),
                             RemoteResolver.remoteLockEnvVars(lockRequest.getVariable(), available));
