@@ -29,6 +29,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import jenkins.model.Jenkins;
 import org.jenkins.plugins.lockableresources.FreeDeadJobs;
+import org.jenkins.plugins.lockableresources.LockCoordinator;
 import org.jenkins.plugins.lockableresources.LockableResource;
 import org.jenkins.plugins.lockableresources.LockableResourceProperty;
 import org.jenkins.plugins.lockableresources.LockableResourcesManager;
@@ -1157,6 +1158,7 @@ public class LockableResourcesRootAction implements RootAction {
             }
             resource.setNote(resourceNote);
             LockableResourcesManager.get().save();
+            definitionChanged(resource);
 
             rsp.forwardToPreviousPage(req);
         }
@@ -1513,6 +1515,7 @@ public class LockableResourcesRootAction implements RootAction {
             rsp.sendError(409, Messages.error_resourceAlreadyExists(name));
             return;
         }
+        definitionChanged(resource);
 
         rsp.forwardToPreviousPage(req);
     }
@@ -1553,6 +1556,7 @@ public class LockableResourcesRootAction implements RootAction {
             resource.setProperties(parsePropertiesFromJson(json));
 
             manager.save();
+            definitionChanged(resource);
         }
         rsp.forwardToPreviousPage(req);
     }
@@ -1584,8 +1588,19 @@ public class LockableResourcesRootAction implements RootAction {
             toRemove.add(resource);
             manager.removeResources(toRemove);
             manager.save();
+            LockCoordinator coordinator = LockCoordinator.get();
+            if (coordinator != null) {
+                coordinator.definitionDeleted(name);
+            }
         }
         rsp.forwardToPreviousPage(req);
+    }
+
+    private static void definitionChanged(LockableResource resource) {
+        LockCoordinator coordinator = LockCoordinator.get();
+        if (coordinator != null) {
+            coordinator.definitionChanged(resource);
+        }
     }
 
     // ---------------------------------------------------------------------------
