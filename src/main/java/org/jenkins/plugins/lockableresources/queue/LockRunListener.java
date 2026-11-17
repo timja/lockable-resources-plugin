@@ -6,6 +6,7 @@
 package org.jenkins.plugins.lockableresources.queue;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.model.AbstractBuild;
@@ -23,8 +24,11 @@ import java.util.stream.Collectors;
 import org.jenkins.plugins.lockableresources.LockableResource;
 import org.jenkins.plugins.lockableresources.LockableResourceProperty;
 import org.jenkins.plugins.lockableresources.LockableResourcesManager;
+import org.jenkins.plugins.lockableresources.ResourceStateStore;
 import org.jenkins.plugins.lockableresources.actions.GroupLockFailureAction;
 import org.jenkins.plugins.lockableresources.actions.ResourceVariableNameAction;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 @Extension
 public class LockRunListener extends RunListener<Run<?, ?>> {
@@ -81,7 +85,7 @@ public class LockRunListener extends RunListener<Run<?, ?>> {
                         failGroupLock(lrm, proj, required, build, listener);
                         return;
                     }
-                    if (lrm.lock(required, build)) {
+                    if (lrm.lock(required, build) || waitForLockHeldElsewhere(lrm, required, build, listener)) {
                         // build.addAction(LockedResourcesBuildAction.fromResources(required));
                         listener.getLogger().printf("%s acquired lock on %s%n", LOG_PREFIX, required);
                         LOGGER.info(build.getFullDisplayName() + " acquired lock on " + required);
@@ -169,4 +173,36 @@ public class LockRunListener extends RunListener<Run<?, ?>> {
         LOGGER.info(build.getFullDisplayName());
         LockableResourcesManager.get().unlockBuild(build);
     }
+    /**
+     * With a {@link ResourceStateStore} shared by several controllers, a build dispatched here may find a resource taken
+     * by another controller between its dispatch and its start. It waits for it rather than run without it. Called
+     * holding {@link LockableResourcesManager#syncResources}, which waiting releases.
+     *
+     * @return true once locked; false if the state is not shared, or if the build was interrupted while waiting
+     */
+    static boolean waitForLockHeldElsewhere(
+            LockableResourcesManager lrm, List<LockableResource> required, Run<?, ?> build, TaskListener listener) {
+        if (!ResourceStateStore.get().isShared()) {
+            return false;
+        }
+        listener.getLogger().printf("%s waiting for %s, taken by another controller%n", LOG_PREFIX, required);
+        LOGGER.info(build.getFullDisplayName() + " waits for " + required + ", taken by another controller");
+        while (true) {
+            try {
+                LockableResourcesManager.syncResources.wait(WAIT_FOR_LOCK_MILLIS);
+            } catch (InterruptedException e) {
+                listener.getLogger().printf("%s interrupted while waiting for %s%n", LOG_PREFIX, required);
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (lrm.lock(required, build)) {
+                return true;
+            }
+        }
+    }
+
+    /** How often a build waiting for resources taken by another controller tries again (not final: for tests). */
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for tests")
+    @Restricted(NoExternalUse.class)
+    public static long WAIT_FOR_LOCK_MILLIS = 2000;
 }

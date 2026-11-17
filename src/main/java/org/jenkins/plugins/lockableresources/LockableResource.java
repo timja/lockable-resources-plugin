@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.function.UnaryOperator;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -315,7 +316,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
      */
     @Exported
     public String getLockReason() {
-        return this.lockReason;
+        return state().getReason();
     }
 
     /**
@@ -325,7 +326,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
      * @param lockReason The reason for locking, or null to clear.
      */
     public void setLockReason(@Nullable String lockReason) {
-        this.lockReason = Util.fixNull(lockReason);
+        change(s -> s.withReason(lockReason));
     }
 
     /**
@@ -580,7 +581,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
         binding.setVariable("resourceDescription", description);
         binding.setVariable("resourceLabels", this.getLabelsAsList());
         binding.setVariable("resourceNote", note);
-        binding.setVariable("resourceLockReason", lockReason);
+        binding.setVariable("resourceLockReason", getLockReason());
         try {
             Object result = script.evaluate(Jenkins.get().getPluginManager().uberClassLoader, binding, null);
             if (LOGGER.isLoggable(Level.FINE)) {
@@ -602,9 +603,14 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
 
     @Exported
     public Date getReservedTimestamp() {
-        return reservedTimestamp == null ? null : new Date(reservedTimestamp.getTime());
+        long since = state().getSince();
+        return since == 0 ? null : new Date(since);
     }
 
+    /**
+     * As declared in the configuration. With a {@link ResourceStateStore} other than the default, the store's state
+     * is what counts.
+     */
     @DataBoundSetter
     public void setReservedTimestamp(@Nullable final Date reservedTimestamp) {
         this.reservedTimestamp = reservedTimestamp == null ? null : new Date(reservedTimestamp.getTime());
@@ -612,7 +618,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
 
     @Exported
     public String getReservedBy() {
-        return reservedBy;
+        return state().getReservedBy();
     }
 
     /** Return true when resource is free. False otherwise */
@@ -623,7 +629,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
 
     @Exported
     public boolean isReserved() {
-        return reservedBy != null;
+        return getReservedBy() != null;
     }
 
     @Restricted(NoExternalUse.class)
@@ -644,14 +650,15 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
      */
     @Restricted(NoExternalUse.class) // called by jelly
     public boolean isReservedByCurrentUser() {
-        return (this.reservedBy != null && Objects.equals(getUserName(), this.reservedBy));
+        String reservedBy = getReservedBy();
+        return (reservedBy != null && Objects.equals(getUserName(), reservedBy));
     }
 
     @Exported
     public String getReservedByEmail() {
         if (isReserved()) {
             UserProperty email = null;
-            User user = Jenkins.get().getUser(reservedBy);
+            User user = Jenkins.get().getUser(getReservedBy());
             if (user != null) email = user.getProperty(UserProperty.class);
             if (email != null) return email.getAddress();
         }
@@ -680,13 +687,18 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
         queuingStarted = 0;
     }
 
+    /**
+     * Whether a build or a remote lock holds this resource. A build that is gone no longer holds it, unless the state
+     * is shared with other controllers: the build may run on another one.
+     */
     @Exported
     public boolean isLocked() {
-        return getBuild() != null || remoteLockedBy != null;
+        ResourceState s = state();
+        return s.getRemoteLock() != null || (s.getBuild() != null && (isShared() || getBuild() != null));
     }
 
     public String getRemoteLockedBy() {
-        return remoteLockedBy;
+        return state().getRemoteLock();
     }
 
     /**
@@ -708,6 +720,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     public RemoteLockRecord getRemoteLockRecord() {
         // The lock cause is also rendered outside a running Jenkins (plain unit tests, deserialized
         // resources), so resolve the manager defensively rather than through Jenkins.get().
+        String remoteLockedBy = getRemoteLockedBy();
         if (remoteLockedBy == null || Jenkins.getInstanceOrNull() == null) {
             return null;
         }
@@ -715,7 +728,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     }
 
     public void setRemoteLockedBy(String lockId) {
-        this.remoteLockedBy = lockId;
+        change(s -> s.withRemoteLock(lockId));
     }
 
     /**
@@ -727,9 +740,11 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     @Exported
     public String getLockCause() {
         final DateFormat format = SimpleDateFormat.getDateTimeInstance(MEDIUM, SHORT);
+        final Date reservedTimestamp = getReservedTimestamp();
         final String timestamp = (reservedTimestamp == null ? "<unknown>" : format.format(reservedTimestamp));
+        final String remoteLockedBy = getRemoteLockedBy();
         if (isReserved()) {
-            return String.format("[%s] is reserved by %s at %s", name, reservedBy, timestamp);
+            return String.format("[%s] is reserved by %s at %s", name, getReservedBy(), timestamp);
         }
         if (remoteLockedBy != null) {
             // A remote lock has no build and no reservedTimestamp; both live on the remote lock record.
@@ -737,7 +752,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
             return String.format("[%s] is locked by %s at %s", name, remoteHolder(record), remoteSince(record, format));
         }
         if (isLocked()) {
-            return String.format("[%s] is locked by %s at %s", name, buildExternalizableId, timestamp);
+            return String.format("[%s] is locked by %s at %s", name, state().getBuild(), timestamp);
         }
         return null;
     }
@@ -746,7 +761,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     @NonNull
     private String remoteHolder(@CheckForNull RemoteLockRecord record) {
         String clientId = record == null ? null : record.getClientId();
-        return clientId != null ? "remote client " + clientId : "remote lockId " + remoteLockedBy;
+        return clientId != null ? "remote client " + clientId : "remote lockId " + getRemoteLockedBy();
     }
 
     /** When the current remote lock was acquired, or {@code <unknown>} if the record is gone. */
@@ -767,6 +782,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     @Restricted(NoExternalUse.class)
     public String getLockCauseDetail() {
         if (this.isReserved()) {
+            String reservedBy = getReservedBy();
             User user = Jenkins.get().getUser(reservedBy);
             String userText = user == null ? reservedBy : ModelHyperlinkNote.encodeTo(user);
             return String.format("The resource [%s] is reserved by %s.", name, userText);
@@ -781,6 +797,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
                         "The resource [%s] is locked by build %s since %s.",
                         name, lockBuild.getFullDisplayName() + " " + ModelHyperlinkNote.encodeTo(lockBuild), timestamp);
             }
+            String remoteLockedBy = getRemoteLockedBy();
             if (remoteLockedBy != null) {
                 // Shown to a locally waiting job, so name the holder rather than the opaque lock id.
                 // The lock id is kept as well: it is what correlates this wait with the remote server's logs.
@@ -789,6 +806,8 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
                         "The resource [%s] is locked by %s (lockId %s) since %s.",
                         name, remoteHolder(record), remoteLockedBy, remoteSince(record, format));
             }
+            // held by a build this controller does not know (it runs on another controller sharing the state)
+            return String.format("The resource [%s] is locked by %s since %s.", name, state().getBuild(), timestamp);
         }
         if (this.isDisabled()) {
             return String.format("The resource [%s] is disabled: %s", name, disabledCause);
@@ -797,10 +816,16 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     }
 
     public Run<?, ?> getBuild() {
-        if (build == null && buildExternalizableId != null) {
-            build = Run.fromExternalizableId(buildExternalizableId);
+        String id = state().getBuild();
+        Run<?, ?> cached = build;
+        if (id == null) {
+            return null;
         }
-        return build;
+        if (cached == null || !id.equals(cached.getExternalizableId())) {
+            cached = Run.fromExternalizableId(id);
+            build = cached;
+        }
+        return cached;
     }
 
     // ---------------------------------------------------------------------------
@@ -812,16 +837,13 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
 
     // ---------------------------------------------------------------------------
     public void setBuild(@Nullable Run<?, ?> lockedBy) {
-
-        this.build = lockedBy;
-
         if (lockedBy != null) {
-            this.buildExternalizableId = lockedBy.getExternalizableId();
-            setReservedTimestamp(new Date());
+            String id = lockedBy.getExternalizableId();
+            change(s -> s.withBuild(id, null));
         } else {
-            this.buildExternalizableId = null;
-            setReservedTimestamp(null);
+            change(s -> s.withoutBuild().withReason(s.getReason()));
         }
+        this.build = lockedBy;
     }
 
     public Task getTask() {
@@ -860,18 +882,24 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
         }
     }
 
+    /**
+     * As declared in the configuration. With a {@link ResourceStateStore} other than the default, the store's state
+     * is what counts: use {@link #reserve(String)}.
+     */
     @DataBoundSetter
     public void setReservedBy(String userName) {
         this.reservedBy = Util.fixEmptyAndTrim(userName);
     }
 
     public void setStolen() {
-        this.stolen = true;
+        change(s -> s.getReservedBy() == null
+                ? new ResourceState(s.getBuild(), s.getRemoteLock(), null, s.getReason(), true, s.getSince())
+                : s.withReservation(s.getReservedBy(), s.getReason(), true).withSince(s.getSince()));
     }
 
     @Exported
     public boolean isStolen() {
-        return this.stolen;
+        return state().isStolen();
     }
 
     public void reserve(String userName) {
@@ -879,24 +907,65 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
     }
 
     public void reserve(String userName, String reason) {
-        setReservedBy(userName);
-        setReservedTimestamp(new Date());
-        setLockReason(reason);
+        change(s -> s.withReservation(userName, reason, s.isStolen()));
     }
 
     public void unReserve() {
-        this.setReservedBy(null);
-        this.setReservedTimestamp(null);
-        this.setLockReason(null);
-        this.stolen = false;
+        change(s -> s.withReservation(null, null, false));
     }
 
     public void reset() {
-        this.unReserve();
+        change(s -> ResourceState.FREE.withRemoteLock(s.getRemoteLock()));
         this.unqueue();
-        this.setBuild(null);
-        this.setLockReason(null);
         invalidateCaches();
+    }
+
+    // ---------------------------------------------------------------------------
+    // the state, kept by the ResourceStateStore
+
+    /** The state of this resource: who holds it. */
+    @NonNull
+    private ResourceState state() {
+        return Jenkins.getInstanceOrNull() == null
+                ? getLocalState()
+                : ResourceStateStore.get().get(this);
+    }
+
+    private static boolean isShared() {
+        return Jenkins.getInstanceOrNull() != null && ResourceStateStore.get().isShared();
+    }
+
+    /** Changes the state of this resource, whatever it is. */
+    private void change(@NonNull UnaryOperator<ResourceState> change) {
+        if (Jenkins.getInstanceOrNull() == null) {
+            setLocalState(change.apply(getLocalState()));
+        } else {
+            ResourceStateStore.get().update(List.of(this), change);
+        }
+    }
+
+    /** The state as this object holds it, saved with the {@link LockableResourcesManager}: the default store's. */
+    @NonNull
+    ResourceState getLocalState() {
+        return new ResourceState(
+                buildExternalizableId,
+                remoteLockedBy,
+                reservedBy,
+                lockReason,
+                stolen,
+                reservedTimestamp == null ? 0 : reservedTimestamp.getTime());
+    }
+
+    void setLocalState(@NonNull ResourceState s) {
+        if (!Objects.equals(buildExternalizableId, s.getBuild())) {
+            build = null;
+        }
+        buildExternalizableId = s.getBuild();
+        remoteLockedBy = s.getRemoteLock();
+        reservedBy = s.getReservedBy();
+        lockReason = s.getReason();
+        stolen = s.isStolen();
+        reservedTimestamp = s.getSince() == 0 ? null : new Date(s.getSince());
     }
 
     /**
@@ -910,7 +979,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
             setReservedTimestamp(sourceResource.getReservedTimestamp());
             setNote(sourceResource.getNote());
             setReservedBy(sourceResource.getReservedBy());
-            setLockReason(sourceResource.getLockReason());
+            this.lockReason = Util.fixNull(sourceResource.getLockReason()); // this object's: it is not shared yet
         }
     }
 
@@ -922,7 +991,7 @@ public class LockableResource extends AbstractDescribableImpl<LockableResource> 
         setReservedBy(null);
         setReservedTimestamp(null);
         setNote("");
-        setLockReason("");
+        this.lockReason = ""; // this object's: it is not shared yet
     }
 
     /**

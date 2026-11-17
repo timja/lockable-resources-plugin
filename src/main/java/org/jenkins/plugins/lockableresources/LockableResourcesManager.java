@@ -1174,13 +1174,15 @@ public class LockableResourcesManager extends GlobalConfiguration {
             return false; // not locked
         }
 
+        ResourceStateStore store = ResourceStateStore.get();
+        String id = build.getExternalizableId();
+        if (!store.update(resourcesToLock, s -> ResourceStateStore.isFree(store, s) ? s.withBuild(id, reason) : null)) {
+            LOGGER.fine("lock() for build " + build + ": a resource was taken meanwhile (e.g. on another controller)");
+            return false; // not locked; queued contexts are offered the resources again once they are free
+        }
         for (LockableResource r : resourcesToLock) {
             r.unqueue();
-            r.setBuild(build);
-            if (reason != null && !reason.isEmpty()) {
-                r.setLockReason(reason);
-            }
-            audit("LOCAL", "ACQUIRED", r.getName(), build.getExternalizableId());
+            audit("LOCAL", "ACQUIRED", r.getName(), id);
         }
 
         LockedResourcesBuildAction.findAndInitAction(build).addUsedResources(getResourcesNames(resourcesToLock));
@@ -1201,16 +1203,16 @@ public class LockableResourcesManager extends GlobalConfiguration {
         }
 
         List<LockableResource> toBeRemoved = new ArrayList<>();
+        ResourceStateStore store = ResourceStateStore.get();
+        String id = build.getExternalizableId();
 
         for (LockableResource resource : unlockResources) {
             // No more contexts, unlock resource
 
             // the resource has been currently unlocked (like by LRM page - button unlock, or by API)
-            if (!build.equals(resource.getBuild())) continue;
+            if (!store.update(List.of(resource), s -> id.equals(s.getBuild()) ? s.withoutBuild() : null)) continue;
 
             resource.unqueue();
-            resource.setBuild(null);
-            resource.setLockReason(null);
             audit("LOCAL", "RELEASED", resource.getName(), build.getExternalizableId());
             uncacheIfFreeing(resource, true, false);
 
@@ -1310,8 +1312,8 @@ public class LockableResourcesManager extends GlobalConfiguration {
         }
         boolean locked = this.lock(requiredResourceForNextContext, build, nextContext.getReason());
         if (!locked) {
-            // defensive; shall never happen
-            LOGGER.warning("Can not lock resources: " + requiredResourceForNextContext);
+            // e.g. taken on another controller sharing the resources meanwhile: the context stays queued
+            LOGGER.fine("Can not lock resources: " + requiredResourceForNextContext);
             return false;
         }
 
@@ -1666,8 +1668,14 @@ public class LockableResourcesManager extends GlobalConfiguration {
                     return false;
                 }
             }
-            for (LockableResource r : resources) {
-                r.reserve(userName, reason);
+            ResourceStateStore store = ResourceStateStore.get();
+            if (!store.update(
+                    resources,
+                    s -> ResourceStateStore.isFree(store, s)
+                            ? s.withReservation(userName, reason, s.isStolen())
+                            : null)) {
+                LOGGER.fine("reserve() failed because a resource was taken meanwhile (e.g. on another controller)");
+                return false;
             }
             save();
         }
@@ -1704,16 +1712,13 @@ public class LockableResourcesManager extends GlobalConfiguration {
                     return false;
                 }
             }
-            for (LockableResource r : resources) {
-                r.setReservedBy(userName);
-                r.setStolen();
-            }
+            ResourceStateStore store = ResourceStateStore.get();
+            store.update(
+                    resources,
+                    s -> s.withReservation(userName, s.getReason(), true).withSince(s.getSince()));
             unlockResources(resources);
-            Date date = new Date();
-            for (LockableResource r : resources) {
-                r.setReservedTimestamp(date);
-                r.setLockReason(reason);
-            }
+            long date = System.currentTimeMillis();
+            store.update(resources, s -> s.withReason(reason).withSince(date));
             save();
         }
         return true;
@@ -1733,14 +1738,10 @@ public class LockableResourcesManager extends GlobalConfiguration {
                     return;
                 }
             }
-            Date date = new Date();
-            for (LockableResource r : resources) {
-                if (!r.isFree()) {
-                    r.unReserve();
-                }
-                r.setReservedBy(userName);
-                r.setReservedTimestamp(date);
-            }
+            ResourceStateStore.get().update(resources, s -> {
+                ResourceState t = s.isFree() ? s : s.withReservation(null, null, false);
+                return t.withReservation(userName, t.getReason(), t.isStolen());
+            });
             save();
         }
     }
@@ -2433,9 +2434,13 @@ public class LockableResourcesManager extends GlobalConfiguration {
                 return false;
             }
         }
+        ResourceStateStore store = ResourceStateStore.get();
+        if (!store.update(resources, s -> ResourceStateStore.isFree(store, s) ? s.withRemoteLock(lockId) : null)) {
+            LOGGER.fine("lockForRemote: a resource was taken meanwhile (e.g. on another controller), lockId=" + lockId);
+            return false;
+        }
         for (LockableResource r : resources) {
             r.unqueue();
-            r.setRemoteLockedBy(lockId);
             audit("REMOTE", "ACQUIRED", r.getName(), lockId);
         }
         save();
@@ -2451,8 +2456,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
         synchronized (syncResources) {
             for (String name : resourceNames) {
                 LockableResource r = fromName(name);
-                if (r != null && lockId.equals(r.getRemoteLockedBy())) {
-                    r.setRemoteLockedBy(null);
+                if (r != null
+                        && ResourceStateStore.get()
+                                .update(
+                                        List.of(r),
+                                        s -> lockId.equals(s.getRemoteLock()) ? s.withRemoteLock(null) : null)) {
                     audit("REMOTE", "RELEASED", name, lockId);
                 }
             }
