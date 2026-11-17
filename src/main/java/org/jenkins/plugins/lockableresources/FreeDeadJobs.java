@@ -38,6 +38,9 @@ public final class FreeDeadJobs {
             LOG.fine("Skipping post mortem resource cleanup because LockableResourcesManager is not registered yet");
             return;
         }
+        if (ResourceStateStore.get().isShared()) {
+            return; // a build not running here may run on another controller: the store frees what dead builds held
+        }
         boolean freedAny = false;
         synchronized (LockableResourcesManager.syncResources) {
             List<LockableResource> orphan = new ArrayList<>();
