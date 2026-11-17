@@ -99,6 +99,37 @@ class LockCoordinatorTest {
     }
 
     @Test
+    void freestyleBuildWaitsForAResourceTakenElsewhereAfterItsDispatch() throws Exception {
+        // dispatched here while the resource looked free (another controller took it meanwhile): the build waits for
+        // it rather than run without it
+        org.jenkins.plugins.lockableresources.queue.LockRunListener.WAIT_FOR_LOCK_MILLIS = 100;
+        fake.elsewhere.add("res");
+        java.util.concurrent.atomic.AtomicBoolean ran = new java.util.concurrent.atomic.AtomicBoolean();
+        hudson.model.FreeStyleProject f = j.createFreeStyleProject("f");
+        f.addProperty(new RequiredResourcesProperty("res", null, null, null, null));
+        f.getBuildersList().add(new org.jvnet.hudson.test.TestBuilder() {
+            @Override
+            public boolean perform(
+                    hudson.model.AbstractBuild<?, ?> build, hudson.Launcher launcher, hudson.model.BuildListener l) {
+                ran.set(true);
+                return true;
+            }
+        });
+        hudson.model.FreeStyleBuild b = f.scheduleBuild2(0).waitForStart();
+        j.waitForMessage("waiting for [res], taken by another controller", b);
+        Thread.sleep(500);
+        assertFalse(ran.get());
+        assertNull(lrm.fromName("res").getBuild());
+
+        fake.elsewhere.remove("res");
+        j.assertBuildStatusSuccess(j.waitForCompletion(b));
+        assertTrue(ran.get());
+        j.assertLogContains("acquired lock on [res]", b);
+        j.assertLogNotContains("failed to lock", b);
+        assertNull(lrm.fromName("res").getBuild());
+    }
+
+    @Test
     void reservationRefusedElsewhere() {
         LockableResource res = lrm.fromName("res");
         fake.elsewhere.add("res");
