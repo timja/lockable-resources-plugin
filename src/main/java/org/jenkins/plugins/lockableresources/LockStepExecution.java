@@ -18,8 +18,10 @@ import java.util.Map.Entry;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import jenkins.util.Timer;
 import org.jenkins.plugins.lockableresources.actions.LockedResourcesBuildAction;
 import org.jenkins.plugins.lockableresources.queue.LockableResourcesStruct;
+import org.jenkins.plugins.lockableresources.queue.QueuedContextStruct;
 import org.jenkins.plugins.lockableresources.remote.RemoteLockRouting;
 import org.jenkins.plugins.lockableresources.remote.RemoteLockSession;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
@@ -57,10 +59,6 @@ public class LockStepExecution extends AbstractStepExecutionImpl implements Remo
 
         Run<?, ?> run = getContext().get(Run.class);
 
-        List<LockableResourcesStruct> resourceHolderList = new ArrayList<>();
-
-        List<LockableResource> available;
-        LinkedHashMap<String, List<LockableResourceProperty>> lockedResources = new LinkedHashMap<>();
         LockableResourcesManager lrm = LockableResourcesManager.get();
 
         if (RemoteLockRouting.isRemoteRequest(step, lrm)) {
@@ -74,56 +72,72 @@ public class LockStepExecution extends AbstractStepExecutionImpl implements Remo
 
             getContext().get(FlowNode.class).addAction(new PauseAction("Lock"));
 
-            if (!lrm.isAllowEmptyOrNullValues() || acquireLock()) {
-                List<String> resourceNames = new ArrayList<>();
-                for (LockStepResource resource : step.getResources()) {
-                    List<String> resources = new ArrayList<>();
-                    if (resource.resource != null) {
-                        if (lrm.createResource(resource.resource)) {
-                            LockableResourcesManager.printLogs(
-                                    "Resource [" + resource.resource + "] did not exist. Created.",
-                                    Level.FINE,
-                                    LOGGER,
-                                    logger);
-                        }
-                        resources.add(resource.resource);
-                        resourceNames.addAll(resources);
-                    } else {
-                        resourceNames.add("N/A");
-                    }
-                    LockableResourcesStruct requirement =
-                            new LockableResourcesStruct(resources, resource.label, resource.quantity);
-                    requirement.setGroup(resource.getGroup());
-                    requirement.setGroupOnly(resource.resource == null && resource.label == null);
-                    resourceHolderList.add(requirement);
-                }
-                LockedResourcesBuildAction.addLog(run, resourceNames, "try", step.toString());
-                // determine if there are enough resources available to proceed
-                available = lrm.getAvailableResources(resourceHolderList, logger, resourceSelectStrategy);
-                if (available == null || available.isEmpty()) {
-                    LOGGER.fine("No available resources: " + available);
-                    onLockFailed(logger, resourceHolderList);
-                    return false;
-                }
-
-                if (!lrm.lock(available, run, step.reason)) {
-                    // this here is very defensive code, and you will probably never hit it. (hopefully)
-                    LOGGER.warning("Internal program error: Can not lock resources: " + available);
-                    onLockFailed(logger, resourceHolderList);
-                    return true;
-                }
-
-                // since LockableResource contains transient variables, they cannot be correctly serialized
-                // hence we use their unique resource names and properties
-                for (LockableResource resource : available) {
-                    lockedResources.put(resource.getName(), resource.getProperties());
-                }
-            }
-
-            LockStepExecution.proceed(lockedResources, getContext(), step.toString(), step.variable);
+            acquireOrQueue(lrm, logger, run, resourceSelectStrategy);
         }
 
         return false;
+    }
+
+    /**
+     * Locks the step's resources and runs its body, or queues the step until they are free. Called holding {@link
+     * LockableResourcesManager#syncResources}.
+     */
+    private void acquireOrQueue(
+            LockableResourcesManager lrm,
+            PrintStream logger,
+            Run<?, ?> run,
+            ResourceSelectStrategy resourceSelectStrategy)
+            throws Exception {
+        List<LockableResourcesStruct> resourceHolderList = new ArrayList<>();
+        List<LockableResource> available;
+        LinkedHashMap<String, List<LockableResourceProperty>> lockedResources = new LinkedHashMap<>();
+        if (!lrm.isAllowEmptyOrNullValues() || acquireLock()) {
+            List<String> resourceNames = new ArrayList<>();
+            for (LockStepResource resource : step.getResources()) {
+                List<String> resources = new ArrayList<>();
+                if (resource.resource != null) {
+                    if (lrm.createResource(resource.resource)) {
+                        LockableResourcesManager.printLogs(
+                                "Resource [" + resource.resource + "] did not exist. Created.",
+                                Level.FINE,
+                                LOGGER,
+                                logger);
+                    }
+                    resources.add(resource.resource);
+                    resourceNames.addAll(resources);
+                } else {
+                    resourceNames.add("N/A");
+                }
+                LockableResourcesStruct requirement =
+                        new LockableResourcesStruct(resources, resource.label, resource.quantity);
+                requirement.setGroup(resource.getGroup());
+                requirement.setGroupOnly(resource.resource == null && resource.label == null);
+                resourceHolderList.add(requirement);
+            }
+            LockedResourcesBuildAction.addLog(run, resourceNames, "try", step.toString());
+            // determine if there are enough resources available to proceed
+            available = lrm.getAvailableResources(resourceHolderList, logger, resourceSelectStrategy);
+            if (available == null || available.isEmpty()) {
+                LOGGER.fine("No available resources: " + available);
+                onLockFailed(logger, resourceHolderList);
+                return;
+            }
+
+            if (!lrm.lock(available, run, step.reason)) {
+                // e.g. taken elsewhere meanwhile (LockCoordinator): wait in the queue like any other build
+                LOGGER.fine("Can not lock resources now: " + available);
+                onLockFailed(logger, resourceHolderList);
+                return;
+            }
+
+            // since LockableResource contains transient variables, they cannot be correctly serialized
+            // hence we use their unique resource names and properties
+            for (LockableResource resource : available) {
+                lockedResources.put(resource.getName(), resource.getProperties());
+            }
+        }
+
+        LockStepExecution.proceed(lockedResources, getContext(), step.toString(), step.variable);
     }
 
     // ---------------------------------------------------------------------------
@@ -514,6 +528,44 @@ public class LockStepExecution extends AbstractStepExecutionImpl implements Remo
     public void onResume() {
         if (remoteSession != null) {
             remoteSession.onResume(this);
+            return;
+        }
+        // Still waiting for its resources (the pause ends once they are locked): normally queued, as the manager keeps
+        // its queue across a restart. A build resumed by another controller (sharing resources through a
+        // LockCoordinator), or whose manager lost its queue, is not, and would wait for good: it asks again.
+        FlowNode node;
+        try {
+            node = getContext().get(FlowNode.class);
+        } catch (IOException | InterruptedException e) {
+            LOGGER.log(Level.WARNING, "Cannot tell whether " + step + " was waiting", e);
+            return;
+        }
+        if (node == null || !PauseAction.isPaused(node)) {
+            return;
+        }
+        Timer.get().submit(this::requestAgain);
+    }
+
+    private void requestAgain() {
+        LockableResourcesManager lrm = LockableResourcesManager.get();
+        try {
+            synchronized (LockableResourcesManager.syncResources) {
+                for (QueuedContextStruct queued : lrm.getCurrentQueuedContext()) {
+                    if (getContext().equals(queued.getContext())) {
+                        return; // still queued here
+                    }
+                }
+                PrintStream logger = getContext().get(TaskListener.class).getLogger();
+                LockableResourcesManager.printLogs(
+                        "Resumed while waiting for [" + step + "]; asking again", Level.FINE, LOGGER, logger);
+                acquireOrQueue(
+                        lrm,
+                        logger,
+                        getContext().get(Run.class),
+                        ResourceSelectStrategy.valueOf(step.resourceSelectStrategy.toUpperCase(Locale.ENGLISH)));
+            }
+        } catch (Exception e) {
+            getContext().onFailure(e);
         }
     }
 }

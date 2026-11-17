@@ -48,6 +48,7 @@ import org.jenkins.plugins.lockableresources.actions.LockedResourcesBuildAction;
 import org.jenkins.plugins.lockableresources.queue.LockableResourcesStruct;
 import org.jenkins.plugins.lockableresources.queue.QueuedContextStruct;
 import org.jenkins.plugins.lockableresources.remote.RemoteCatalogCache;
+import org.jenkins.plugins.lockableresources.remote.RemoteLockManager;
 import org.jenkins.plugins.lockableresources.remote.RemoteQueueEntry;
 import org.jenkins.plugins.lockableresources.remote.RemoteResolver;
 import org.jenkins.plugins.lockableresources.util.Constants;
@@ -55,6 +56,7 @@ import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.SecureGroovyScript;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -1158,6 +1160,12 @@ public class LockableResourcesManager extends GlobalConfiguration {
             return false; // not locked
         }
 
+        LockCoordinator coordinator = LockCoordinator.get();
+        if (coordinator != null && !coordinator.tryLock(resourcesToLock, build)) {
+            LOGGER.fine("lock() for build " + build + ": some resource is held elsewhere");
+            return false; // not locked; it stays queued and is offered the resources again once released there
+        }
+
         for (LockableResource r : resourcesToLock) {
             r.unqueue();
             r.setBuild(build);
@@ -1195,6 +1203,10 @@ public class LockableResourcesManager extends GlobalConfiguration {
             resource.unqueue();
             resource.setBuild(null);
             resource.setLockReason(null);
+            LockCoordinator coordinator = LockCoordinator.get();
+            if (coordinator != null) {
+                coordinator.released(resource, build);
+            }
             audit("LOCAL", "RELEASED", resource.getName(), build.getExternalizableId());
             uncacheIfFreeing(resource, true, false);
 
@@ -1209,6 +1221,17 @@ public class LockableResourcesManager extends GlobalConfiguration {
 
         // remove all ephemeral resources
         removeResources(toBeRemoved);
+    }
+
+    /**
+     * The names of the resources a build holds, as recorded with the build (for a {@link LockCoordinator} taking
+     * over the locks of a build resumed on this controller).
+     */
+    @Restricted(Beta.class)
+    @NonNull
+    public static List<String> getResourceNamesHeldBy(@NonNull Run<?, ?> build) {
+        LockedResourcesBuildAction action = build.getAction(LockedResourcesBuildAction.class);
+        return action == null ? List.of() : action.getCurrentUsedResourceNames();
     }
 
     public void unlockBuild(@Nullable Run<?, ?> build) {
@@ -1249,6 +1272,15 @@ public class LockableResourcesManager extends GlobalConfiguration {
             return;
         }
         synchronized (syncResources) {
+            LockCoordinator coordinator = LockCoordinator.get();
+            if (build == null && coordinator != null) {
+                // unlocked from the resources page: a resource held elsewhere is freed there
+                for (LockableResource r : resourcesToUnLock) {
+                    if (coordinator.isHeldElsewhere(r)) {
+                        coordinator.freed(r);
+                    }
+                }
+            }
             this.freeResources(resourcesToUnLock, build);
 
             while (proceedNextContext()) {
@@ -1294,8 +1326,8 @@ public class LockableResourcesManager extends GlobalConfiguration {
         }
         boolean locked = this.lock(requiredResourceForNextContext, build, nextContext.getReason());
         if (!locked) {
-            // defensive; shall never happen
-            LOGGER.warning("Can not lock resources: " + requiredResourceForNextContext);
+            // e.g. taken elsewhere meanwhile (LockCoordinator): the context stays queued
+            LOGGER.fine("Can not lock resources: " + requiredResourceForNextContext);
             return false;
         }
 
@@ -1321,7 +1353,10 @@ public class LockableResourcesManager extends GlobalConfiguration {
         }
         boolean locked = lockForRemote(resources, entry.getLockId());
         if (!locked) {
-            LOGGER.warning("Cannot lock remote resources: " + entry.getLockId());
+            // with a LockCoordinator, e.g. taken elsewhere meanwhile: the entry stays queued
+            LOGGER.log(
+                    LockCoordinator.get() == null ? Level.WARNING : Level.FINE,
+                    "Cannot lock remote resources: " + entry.getLockId());
             return false;
         }
         getRemoteQueueEntries().remove(entry);
@@ -1563,7 +1598,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
         return this.addResource(resource, /*doSave*/ false);
     }
     // ---------------------------------------------------------------------------
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class) // for a LockCoordinator
     public boolean addResource(@Nullable final LockableResource resource, final boolean doSave) {
 
         if (resource == null || resource.getName() == null || resource.getName().isEmpty()) {
@@ -1627,6 +1662,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
                     return false;
                 }
             }
+            LockCoordinator coordinator = LockCoordinator.get();
+            if (coordinator != null && !coordinator.tryReserve(resources, userName, reason)) {
+                LOGGER.fine("reserve() failed because a resource is held elsewhere");
+                return false;
+            }
             for (LockableResource r : resources) {
                 r.reserve(userName, reason);
             }
@@ -1659,6 +1699,7 @@ public class LockableResourcesManager extends GlobalConfiguration {
      */
     public boolean steal(List<LockableResource> resources, String userName, String reason) {
         synchronized (syncResources) {
+            LockCoordinator coordinator = LockCoordinator.get();
             for (LockableResource r : resources) {
                 if (r.isDisabled()) {
                     LOGGER.fine("steal() failed because resource is disabled: " + r.getName());
@@ -1666,6 +1707,9 @@ public class LockableResourcesManager extends GlobalConfiguration {
                 }
             }
             for (LockableResource r : resources) {
+                if (coordinator != null) {
+                    coordinator.reservedForcibly(r, userName, reason, true); // before the build here releases it
+                }
                 r.setReservedBy(userName);
                 r.setStolen();
             }
@@ -1695,7 +1739,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
                 }
             }
             Date date = new Date();
+            LockCoordinator coordinator = LockCoordinator.get();
             for (LockableResource r : resources) {
+                if (coordinator != null) {
+                    coordinator.reservedForcibly(r, userName, null, false);
+                }
                 if (!r.isFree()) {
                     r.unReserve();
                 }
@@ -1708,7 +1756,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
 
     // ---------------------------------------------------------------------------
     private void unreserveResources(@NonNull List<LockableResource> resources) {
+        LockCoordinator coordinator = LockCoordinator.get();
         for (LockableResource l : resources) {
+            if (coordinator != null) {
+                coordinator.unreserved(l);
+            }
             uncacheIfFreeing(l, false, true);
             l.unReserve();
         }
@@ -1743,7 +1795,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
     // ---------------------------------------------------------------------------
     public void reset(List<LockableResource> resources) {
         synchronized (syncResources) {
+            LockCoordinator coordinator = LockCoordinator.get();
             for (LockableResource r : resources) {
+                if (coordinator != null) {
+                    coordinator.freed(r);
+                }
                 uncacheIfFreeing(r, true, true);
                 r.reset();
             }
@@ -2390,6 +2446,11 @@ public class LockableResourcesManager extends GlobalConfiguration {
                 return false;
             }
         }
+        LockCoordinator coordinator = LockCoordinator.get();
+        if (coordinator != null && !coordinator.tryLockForRemote(resources, lockId)) {
+            LOGGER.fine("lockForRemote: some resource is held elsewhere, lockId=" + lockId);
+            return false;
+        }
         for (LockableResource r : resources) {
             r.unqueue();
             r.setRemoteLockedBy(lockId);
@@ -2410,6 +2471,10 @@ public class LockableResourcesManager extends GlobalConfiguration {
                 LockableResource r = fromName(name);
                 if (r != null && lockId.equals(r.getRemoteLockedBy())) {
                     r.setRemoteLockedBy(null);
+                    LockCoordinator coordinator = LockCoordinator.get();
+                    if (coordinator != null) {
+                        coordinator.releasedForRemote(r, lockId);
+                    }
                     audit("REMOTE", "RELEASED", name, lockId);
                 }
             }
@@ -2419,6 +2484,16 @@ public class LockableResourcesManager extends GlobalConfiguration {
             save();
         }
         scheduleQueueMaintenance();
+    }
+
+    /**
+     * Ends a remote lock held here, as a force release on the resources page does: for a {@link LockCoordinator}
+     * whose resources were freed or taken on another controller while held here for that lock. Its client finds the
+     * lock gone. Does nothing for an unknown or ended lock. Not to be called holding {@link #syncResources}.
+     */
+    @Restricted(Beta.class)
+    public void releaseRemoteLock(@NonNull String lockId) {
+        RemoteLockManager.get().release(lockId);
     }
 
     // ---------------------------------------------------------------------------
