@@ -1,5 +1,6 @@
 package org.jenkins.plugins.lockableresources;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import hudson.Functions;
@@ -71,6 +72,76 @@ class LockStepWithRestartTest extends LockStepTestBase {
             SemaphoreStep.success("wait-inside-lockOrderRestart/3", null);
             j.waitForMessage("Finish", b3);
             isPaused(b3, 1, 0);
+        });
+    }
+
+    /**
+     * A build resumed while its {@code lock} step waits, with the step missing from the queue: as on another controller
+     * that took the build over (sharing resources through a {@link ResourceStateStore}), or a manager whose queue was lost.
+     * The step asks for its resources again rather than waiting for good.
+     */
+    @Test
+    void waitingStepMissingFromTheQueueAsksAgainOnResume() throws Throwable {
+        sessions.then(j -> {
+            LockableResourcesManager.get().createResource("resource1");
+            WorkflowJob p = j.jenkins.createProject(WorkflowJob.class, "p");
+            p.setDefinition(new CpsFlowDefinition("""
+                    lock('resource1') {
+                      semaphore 'inside'
+                    }
+                    echo 'Finish'""", true));
+            WorkflowRun b1 = p.scheduleBuild2(0).waitForStart();
+            SemaphoreStep.waitForStart("inside/1", b1);
+            WorkflowRun b2 = p.scheduleBuild2(0).waitForStart();
+            j.waitForMessage("[resource1] is locked by build " + b1.getFullDisplayName(), b2);
+            isPaused(b2, 1, 1);
+            LockableResourcesManager lrm = LockableResourcesManager.get();
+            synchronized (LockableResourcesManager.syncResources) {
+                assertEquals(1, lrm.getCurrentQueuedContext().size());
+                lrm.unqueueContext(lrm.getCurrentQueuedContext().get(0).getContext());
+                lrm.save();
+            }
+        });
+
+        sessions.then(j -> {
+            WorkflowJob p = j.jenkins.getItemByFullName("p", WorkflowJob.class);
+            WorkflowRun b1 = p.getBuildByNumber(1);
+            WorkflowRun b2 = p.getBuildByNumber(2);
+            j.waitForMessage("asking again", b2);
+            SemaphoreStep.success("inside/1", null);
+            j.assertBuildStatusSuccess(j.waitForCompletion(b1));
+            SemaphoreStep.waitForStart("inside/2", b2);
+            j.assertLogContains("Lock acquired on [Resource: resource1]", b2);
+            SemaphoreStep.success("inside/2", null);
+            j.assertBuildStatusSuccess(j.waitForCompletion(b2));
+            assertEquals(
+                    0, LockableResourcesManager.get().getCurrentQueuedContext().size());
+        });
+    }
+
+    /** A build resumed while its {@code lock} step waits, still queued: it is not queued twice. */
+    @Test
+    void waitingStepStillQueuedIsNotQueuedTwiceOnResume() throws Throwable {
+        sessions.then(j -> {
+            LockableResourcesManager.get().createResource("resource1");
+            WorkflowJob p = j.jenkins.createProject(WorkflowJob.class, "p");
+            p.setDefinition(new CpsFlowDefinition("lock('resource1') { semaphore 'inside' }", true));
+            WorkflowRun b1 = p.scheduleBuild2(0).waitForStart();
+            SemaphoreStep.waitForStart("inside/1", b1);
+            WorkflowRun b2 = p.scheduleBuild2(0).waitForStart();
+            j.waitForMessage("[resource1] is locked by build " + b1.getFullDisplayName(), b2);
+        });
+
+        sessions.then(j -> {
+            WorkflowRun b2 = j.jenkins.getItemByFullName("p", WorkflowJob.class).getBuildByNumber(2);
+            Thread.sleep(2000); // the resumption has run
+            assertEquals(
+                    1, LockableResourcesManager.get().getCurrentQueuedContext().size());
+            j.assertLogNotContains("asking again", b2);
+            SemaphoreStep.success("inside/1", null);
+            SemaphoreStep.waitForStart("inside/2", b2);
+            SemaphoreStep.success("inside/2", null);
+            j.assertBuildStatusSuccess(j.waitForCompletion(b2));
         });
     }
 
